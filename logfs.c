@@ -38,21 +38,11 @@ struct logfs{
     pthread_t worker_thread;
     pthread_mutex_t wcache_mutex;
     pthread_cond_t wcache_cond_worker_thread;
-    void * write_cache;
-    void * read_cache;
-    uint64_t wcache_head;
-    uint64_t wcache_tail;
+    void * write_cache, * read_cache, * wcache_head, * wcache_tail;
     uint64_t block_size;
     uint64_t offset;
+    size_t read_cache_size, write_cache_size;
 };
-
-static void *write_cache_worker_thread(void *arg) { 
-    /* Consumer */
-    struct logfs *logfs;
-    logfs = (struct logfs *)arg;
-
-    return NULL;
-}
 
 uint64_t size_align(uint64_t len, uint64_t block_size){
 	uint64_t r;
@@ -62,28 +52,63 @@ uint64_t size_align(uint64_t len, uint64_t block_size){
 	return len + r;
 }
 
-static void *write_cache_user_thread(struct logfs *logfs, const void *buf, uint64_t len) { 
-    /* Producer */
+static void flushData(struct logfs *logfs){
     void *mem_aligned_buffer;
-    uint64_t mem_aligned_buffer_size;
+    uint64_t mem_aligned_buffer_size, len;
+
+    len = logfs->wcache_head - logfs->wcache_tail;
 
     /* Create a block aligned buffer */
     mem_aligned_buffer_size = size_align(len, logfs->block_size);
     mem_aligned_buffer = malloc(mem_aligned_buffer_size);
     if(!mem_aligned_buffer){
         TRACE("Failed malloc for mem_aligned_buffer");
+        logfs_close(logfs);
+        return NULL;
     }
     memset(mem_aligned_buffer,0,sizeof(mem_aligned_buffer));
 
     /* Copy data from buf to mem_aligned_buffer */
-    memcpy(mem_aligned_buffer, buf, len);
+    memcpy(mem_aligned_buffer, logfs->wcache_tail, len);
+
+    /* Reset head and tail to beginning */
+    logfs->wcache_head  = logfs->wcache_tail = logfs->write_cache;
+
+    device_write(logfs->device, mem_aligned_buffer, logfs->offset, mem_aligned_buffer_size);
+    logfs->offset += mem_aligned_buffer_size;
+
+    FREE(mem_aligned_buffer);
+}
+
+static void *write_cache_worker_thread(struct logfs *logfs) { 
+    /* Consumer */
+    while(0 == terminateConsumer){
+        /* Acquire mutex lock*/
+        pthread_mutex_lock(&logfs->wcache_mutex);
+
+        /* If condition not met, release mutex and wait/sleep */
+        while(logfs->wcache_head == logfs->wcache_tail){
+            /* pthread wait*/
+            pthread_cond_wait(&logfs->wcache_cond_worker_thread, &logfs->wcache_mutex);
+        }
+        /* Flush data */
+        flushData(logfs);
+
+        /* Release mutex */
+        pthread_mutex_unlock(&logfs->wcache_mutex);
+    }
+    return NULL;
+}
+
+static void *write_cache_user_thread(struct logfs *logfs, const void *buf, uint64_t len) { 
+    /* Producer */
 
     /* Acquire mutex lock */
     pthread_mutex_lock(&logfs->wcache_mutex);
 
-    /* Perform write */
-    device_write(logfs->device, mem_aligned_buffer, logfs->offset, mem_aligned_buffer_size);
-    logfs->offset += mem_aligned_buffer_size;
+    /* Perform write to the write buffer */
+    memcpy(logfs->wcache_head, buf, len);
+    logfs->wcache_head += len;
 
     /* Signal consumer */
     pthread_cond_signal(&logfs->wcache_cond_worker_thread);
@@ -124,9 +149,10 @@ struct logfs *logfs_open(const char *pathname){
         TRACE("Failed Malloc for write_cache");
         return NULL;
     }
-    logfs->wcache_head = 0;
-    logfs->wcache_tail = 0;
+    logfs->wcache_head = logfs->wcache_tail = logfs->write_cache;
     logfs->offset = 0;
+    logfs->write_cache_size = logfs->block_size * WCACHE_BLOCKS;
+    logfs->read_cache_size = logfs->block_size * RCACHE_BLOCKS;
 
     pthread_mutex_init(&logfs->wcache_mutex, NULL);
     pthread_cond_init(&logfs->wcache_cond_worker_thread, NULL);
@@ -141,6 +167,7 @@ void logfs_close(struct logfs *logfs){
     FREE(logfs->read_cache);
     FREE(logfs->write_cache);
     /* Flush data */
+    flushData(logfs);
 
     /*Signal worker to end execution*/
     terminateConsumer = 1;
