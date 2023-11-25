@@ -70,7 +70,6 @@ static void flushData(struct logfs *logfs){
 
     /* Reset head and tail to beginning */
     logfs->wcache_head  = logfs->wcache_tail = logfs->write_cache;
-
 }
 
 static void *write_cache_worker_thread(struct logfs *logfs) { 
@@ -80,8 +79,8 @@ static void *write_cache_worker_thread(struct logfs *logfs) {
         pthread_mutex_lock(&logfs->wcache_mutex);
 
         /* If condition not met, release mutex and wait/sleep */
-        while(logfs->wcache_head == logfs->wcache_tail){
-            /* pthread wait*/
+        while((logfs->wcache_head == logfs->wcache_tail) && (0 == terminateConsumer)){
+            /* pthread_cond_wait call handles the unlocking of the mutex before waiting and relocks it upon waking up */
             pthread_cond_wait(&logfs->wcache_cond_worker_thread, &logfs->wcache_mutex);
         }
         /* Flush data */
@@ -164,6 +163,7 @@ void logfs_close(struct logfs *logfs){
 
     /*Signal worker to end execution*/
     terminateConsumer = 1;
+    pthread_cond_signal(&logfs->wcache_cond_worker_thread);
 
     pthread_join(logfs->worker_thread, NULL);
 
