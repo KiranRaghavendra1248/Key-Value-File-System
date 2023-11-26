@@ -6,3 +6,11 @@ logfs.d
 main.d
 system.d
 term.d
+device.o
+index.o
+kvdb.o
+kvraw.o
+logfs.o
+main.o
+system.o
+term.o

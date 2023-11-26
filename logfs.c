@@ -38,7 +38,7 @@ struct logfs{
     pthread_t worker_thread;
     pthread_mutex_t wcache_mutex;
     pthread_cond_t wcache_cond_worker_thread;
-    void * write_cache, * read_cache, * wcache_head, * wcache_tail;
+    char * write_cache, * read_cache, * wcache_head, * wcache_tail;
     uint64_t block_size;
     uint64_t offset;
     size_t read_cache_size, write_cache_size;
@@ -56,12 +56,14 @@ static void flushData(struct logfs *logfs){
 
     /* Move tail forward */
     logfs->wcache_tail += len;
-    if(logfs->wcache_tail == logfs->write_cache_size){
+    if(logfs->wcache_tail == logfs->write_cache + logfs->write_cache_size){
         logfs->wcache_tail = logfs->write_cache;
     }
 }
 
-static void *write_cache_worker_thread(struct logfs *logfs) { 
+static void *write_cache_worker_thread(void * args) { 
+    struct logfs *logfs;
+    logfs = (struct logfs *)args;
     /* Consumer */
     while(0 == terminateConsumer){
         /* Acquire mutex lock*/
@@ -93,7 +95,7 @@ static void *write_cache_user_thread(struct logfs *logfs, const void *buf, uint6
     /* Perform write to the write buffer */
     memcpy(logfs->wcache_head, buf, len);
     logfs->wcache_head += len;
-    if(logfs->wcache_head == logfs->write_cache_size){
+    if(logfs->wcache_head == logfs->write_cache + logfs->write_cache_size){
         logfs->wcache_head = logfs->write_cache;
     }
 
@@ -169,16 +171,12 @@ void logfs_close(struct logfs *logfs){
     FREE(logfs);
 }
 
-int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len){
-
-}
-
 int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
     uint64_t remaining;
-    const void *temp_buf, *traverse_ptr;
+    char *temp_buf, *traverse_ptr;
     remaining = len;
-    traverse_ptr = buf;
-    temp_buf = malloc(logfs->block_size);
+    traverse_ptr = (char*)buf;
+    temp_buf = (char *)malloc(logfs->block_size);
             if(!temp_buf){
                 TRACE("Malloc Failed for temp_buf!!");
                 logfs_close(logfs);
@@ -186,13 +184,13 @@ int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
             }
     while(remaining > 0){
         if(remaining >= logfs->block_size){
-            memset(temp_buf,0,sizeof(temp_buf));
+            memset(temp_buf,0,logfs->block_size);
             memcpy(temp_buf, traverse_ptr, logfs->block_size);
             traverse_ptr += logfs->block_size;
             remaining -= logfs->block_size;
         }
         else{
-            memset(temp_buf,0,sizeof(temp_buf));
+            memset(temp_buf,0,logfs->block_size);
             memcpy(temp_buf, traverse_ptr, remaining);
             traverse_ptr += remaining;
             remaining = 0;
