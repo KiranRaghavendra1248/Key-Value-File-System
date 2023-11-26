@@ -39,8 +39,7 @@ struct logfs{
     pthread_mutex_t wcache_mutex;
     pthread_cond_t wcache_cond_worker_thread;
     char * write_cache, * read_cache, * wcache_head, * wcache_tail;
-    uint64_t block_size;
-    uint64_t offset;
+    uint64_t block_size, read_cache_block_size, offset;
     size_t read_cache_size, write_cache_size;
 };
 
@@ -124,13 +123,14 @@ struct logfs *logfs_open(const char *pathname){
         return NULL;
     }
     logfs->block_size = device_block(logfs->device);
-    logfs->read_cache = malloc(logfs->block_size * RCACHE_BLOCKS);
+    logfs->read_cache_block_size = sizeof(uint64_t) + logfs->block_size;
+    logfs->read_cache = (char *)malloc(logfs->read_cache_block_size* RCACHE_BLOCKS);
     if(!logfs->read_cache){
         FREE(logfs);
         TRACE("Failed Malloc for read_cache");
         return NULL;
     }
-    logfs->write_cache = malloc(logfs->block_size * WCACHE_BLOCKS);
+    logfs->write_cache = (char *)malloc(logfs->block_size * WCACHE_BLOCKS);
     if(!logfs->write_cache){
         FREE(logfs->read_cache);
         FREE(logfs);
@@ -199,4 +199,49 @@ int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
     }
     FREE(temp_buf);
     return 0;
+}
+uint64_t getLowerBlockBoundary(uint64_t size, uint64_t n){
+    return n - (n%size);
+}
+uint64_t getUpperBlockBoundary(uint64_t size, uint64_t n){
+    uint64_t temp;
+    temp = size-(n%size);
+    return n + temp;
+}
+int checkCache(uint64_t actualOffset){
+    /* returns if cache entry is present or not */
+}
+void readToCache(uint64_t actualOffset){
+    /* read data at this actual offset into cache and store it at cache offset */
+}
+char* readFromCache(uint64_t cacheOffset, uint64_t start, uint64_t len, char* buf){
+    /* read data from cache from this location and store it into buffer */
+}
+int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len){
+    uint64_t lower_block_boundary, upper_block_boundary, i, start, len, rem, curr_block_boundary, cacheOffset;
+    char* traverse_ptr;
+    size_t remaining;
+    traverse_ptr = (char*)buf;
+    lower_block_boundary = getLowerBlockBoundary(logfs->block_size, off);
+    upper_block_boundary = getUpperBlockBoundary(logfs->block_size, off+len);
+    for(i=lower_block_boundary, i<upper_block_boundary, i += logfs->block_size){
+        if(!checkCache(i)){
+            readToCache(i);
+        }
+    }
+    remaining = len;
+    curr_block_boundary = lower_block_boundary;
+    while(remaining>0){
+        start = off%(logfs->block_size);
+        rem = logfs->block_size - start;
+        if(remaining > rem){
+            len = rem;
+        }
+        else{
+            len = remaining;
+        }
+        cacheOffset = curr_block_boundary%RCACHE_BLOCKS;
+        traverse_ptr = readFromCache(cacheOffset, start, len, traverse_ptr);
+        curr_block_boundary += logfs->block_size;
+    }
 }
