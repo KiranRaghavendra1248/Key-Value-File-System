@@ -30,218 +30,304 @@
 
 /* research the above Needed API and design accordingly */
 
-int shouldRunProducer = 0;
-int terminateConsumer = 0;
-
-struct logfs{
-    struct device *device;
-    pthread_t worker_thread;
-    pthread_mutex_t wcache_mutex;
-    pthread_cond_t wcache_cond_worker_thread;
-    char * write_cache, * read_cache, * wcache_head, * wcache_tail;
-    uint64_t block_size, read_cache_block_size, offset;
-    size_t read_cache_size, write_cache_size;
+struct block {
+        uint64_t block;
+        void *buf;
 };
 
-static void flushData(struct logfs *logfs){
+struct logfs {
+        struct device* device;
+        uint8_t completed;
+        pthread_t worker_thread;
+        uint64_t off, block_size, available;
+        void *cur_block, *cur_off;
+        struct wcache_info {
+            pthread_mutex_t mutex;
+                pthread_cond_t user_cond;
+                pthread_cond_t worker_cond;
+                uint8_t head;
+                uint8_t tail;
+                uint8_t written_blocks;
+        } wc_info;
+        struct block write_cache[WCACHE_BLOCKS], read_cache[RCACHE_BLOCKS];
+};
 
-    uint64_t len;
-
-    len = logfs->block_size;
-
-    /* Write to device */
-    device_write(logfs->device, logfs->wcache_tail, logfs->offset, len);
-    logfs->offset += len;
-
-    /* Move tail forward */
-    logfs->wcache_tail += len;
-    if(logfs->wcache_tail == logfs->write_cache + logfs->write_cache_size){
-        logfs->wcache_tail = logfs->write_cache;
-    }
+uint64_t get_lower_boundary(struct logfs *logfs, uint64_t off) {
+        return (off - (off % logfs->block_size));
 }
 
-static void *write_cache_worker_thread(void * args) { 
-    struct logfs *logfs;
-    logfs = (struct logfs *)args;
-    /* Consumer */
-    while(0 == terminateConsumer){
-        /* Acquire mutex lock*/
-        pthread_mutex_lock(&logfs->wcache_mutex);
+void flushData(struct logfs* logfs) {
+        void *tmp_buf = malloc(2*logfs->block_size);
+        void *buf = memory_align(tmp_buf, logfs->block_size);
+        struct block *write_cache_block;
 
-        /* If condition not met, release mutex and wait/sleep */
-        while((logfs->wcache_head == logfs->wcache_tail) && (0 == terminateConsumer)){
-            /* pthread_cond_wait call handles the unlocking of the mutex before waiting and relocks it upon waking up */
-            pthread_cond_wait(&logfs->wcache_cond_worker_thread, &logfs->wcache_mutex);
+        if (0 != pthread_mutex_lock(&logfs->wc_info.mutex)) {
+                TRACE("error in flush data");
+                exit(1);
         }
-        if(1 == terminateConsumer){
-            break;
+        while ((!logfs->completed) &&
+               (logfs->wc_info.written_blocks <= 0)) {
+                if (0 != pthread_cond_wait(&logfs->wc_info.worker_cond,
+                                           &logfs->wc_info.mutex)) {
+                        TRACE("error in flush data");
+                        exit(1);
+                }
         }
-        /* Flush data */
-        flushData(logfs);
 
-        /* Release mutex */
-        pthread_mutex_unlock(&logfs->wcache_mutex);
-    }
-    return NULL;
+        if (logfs->completed) {
+                free(tmp_buf);
+                if (0 != pthread_mutex_unlock(&logfs->wc_info.mutex)) {
+                        TRACE("error in flush data");
+                        exit(1);
+                }
+                return;
+        }
+
+        write_cache_block = &logfs->write_cache[logfs->wc_info.tail];
+        memcpy(buf, write_cache_block->buf, logfs->block_size);
+
+        logfs->wc_info.tail = (logfs->wc_info.tail + 1) % WCACHE_BLOCKS;
+        logfs->wc_info.written_blocks--;
+        pthread_cond_signal(&logfs->wc_info.user_cond);
+
+        if (0 != pthread_mutex_unlock(&logfs->wc_info.mutex)) {
+                TRACE("error in flush data");
+                exit(1);
+        }
+
+        if (device_write(logfs->device,
+                         buf,
+                         write_cache_block->block,
+                         logfs->block_size)) {
+                TRACE("error in flush data");
+                exit(1);
+        }
+        free(tmp_buf);
 }
 
-static void *write_cache_user_thread(struct logfs *logfs, const void *buf, uint64_t len) { 
-    /* Producer */
-
-    /* Acquire mutex lock */
-    pthread_mutex_lock(&logfs->wcache_mutex);
-
-    /* Perform write to the write buffer */
-    memcpy(logfs->wcache_head, buf, len);
-    logfs->wcache_head += len;
-    if(logfs->wcache_head == logfs->write_cache + logfs->write_cache_size){
-        logfs->wcache_head = logfs->write_cache;
-    }
-
-    /* Signal consumer */
-    pthread_cond_signal(&logfs->wcache_cond_worker_thread);
-
-    /* Release mutex */
-    pthread_mutex_unlock(&logfs->wcache_mutex);
-
-    return NULL;
+void* worker_thread(void* arg) {
+        struct logfs *logfs = (struct logfs*)arg;
+        while (!logfs->completed) {
+                flushData(logfs);
+        }
+        pthread_exit(NULL);
 }
 
-struct logfs *logfs_open(const char *pathname){
-    struct logfs * logfs;
-    pthread_t worker_thread;
+struct logfs *logfs_open(const char *pathname) {
+        struct logfs* logfs;
+        int i;
 
-    logfs = (struct logfs *)malloc(sizeof(struct logfs));
-    if(!logfs){
-        TRACE("Failed Malloc for logfs!!");
-        return NULL;
-    }
-    logfs->device = device_open(pathname);
-    if (!logfs->device) {
-        FREE(logfs);
-        TRACE("Failed device open");
-        return NULL;
-    }
-    logfs->block_size = device_block(logfs->device);
-    logfs->read_cache_block_size = sizeof(uint64_t) + logfs->block_size;
-    logfs->read_cache = (char *)malloc(logfs->read_cache_block_size* RCACHE_BLOCKS);
-    if(!logfs->read_cache){
-        FREE(logfs);
-        TRACE("Failed Malloc for read_cache");
-        return NULL;
-    }
-    logfs->write_cache = (char *)malloc(logfs->block_size * WCACHE_BLOCKS);
-    if(!logfs->write_cache){
-        FREE(logfs->read_cache);
-        FREE(logfs);
-        TRACE("Failed Malloc for write_cache");
-        return NULL;
-    }
-    logfs->wcache_head = logfs->wcache_tail = logfs->write_cache;
-    logfs->offset = 0;
-    logfs->write_cache_size = logfs->block_size * WCACHE_BLOCKS;
-    logfs->read_cache_size = logfs->block_size * RCACHE_BLOCKS;
+        logfs = (struct logfs*) malloc(sizeof(struct logfs));
 
-    pthread_mutex_init(&logfs->wcache_mutex, NULL);
-    pthread_cond_init(&logfs->wcache_cond_worker_thread, NULL);
-    pthread_create(&worker_thread, NULL, write_cache_worker_thread, logfs);
-    return logfs;
+        logfs->device = device_open(pathname);
+        if (NULL == logfs->device) {
+                TRACE("unable to open device");
+                free(logfs);
+                return NULL;
+        }
+
+        logfs->off = 0;
+        logfs->completed = 0;
+        logfs->block_size = device_block(logfs->device);
+        logfs->wc_info.head = 0;
+        logfs->wc_info.tail = 0;
+        logfs->wc_info.written_blocks = 0;
+
+        logfs->cur_block = malloc(logfs->block_size);
+        memset(logfs->cur_block, 0, logfs->block_size);
+        logfs->available = logfs->block_size;
+
+        logfs->cur_off = logfs->cur_block;
+
+        for (i=0; i<RCACHE_BLOCKS; i++) {
+                logfs->read_cache[i].block = 7; 
+                logfs->read_cache[i].buf = malloc(logfs->block_size);
+        }
+
+        for (i=0; i<WCACHE_BLOCKS; i++) {
+                logfs->write_cache[i].block = 7; 
+                logfs->write_cache[i].buf = malloc(logfs->block_size);
+        }
+
+        if (0 != pthread_cond_init(&logfs->wc_info.worker_cond, NULL)) {
+                exit(1);
+        }
+
+        if (0 != pthread_cond_init(&logfs->wc_info.user_cond, NULL)) {
+                exit(1);
+        }
+
+        if (0 != pthread_mutex_init(&logfs->wc_info.mutex, NULL)) {
+                exit(1);
+        }
+
+        if (0 != pthread_create(&logfs->worker_thread, NULL, &worker_thread, (void*)logfs)) {
+                exit(1);
+        }
+
+        return logfs;
 }
 
-void logfs_close(struct logfs *logfs){
-    if(NULL == logfs){
-        return;
-    }
-    FREE(logfs->read_cache);
-    FREE(logfs->write_cache);
-    /* Flush data */
-    while(logfs->wcache_head != logfs->wcache_tail){
-        flushData(logfs);
-    }
+void logfs_close(struct logfs* logfs) {
+        int i;       
+        logfs->completed = 1;
+        pthread_cond_signal(&logfs->wc_info.worker_cond);
+        pthread_cond_signal(&logfs->wc_info.user_cond);
+        pthread_mutex_destroy(&logfs->wc_info.mutex);
+        pthread_cond_destroy(&logfs->wc_info.user_cond);
+        pthread_cond_destroy(&logfs->wc_info.worker_cond);
 
-    /*Signal worker to end execution*/
-    terminateConsumer = 1;
-    pthread_cond_signal(&logfs->wcache_cond_worker_thread);
-
-    pthread_join(logfs->worker_thread, NULL);
-
-    pthread_mutex_destroy(&logfs->wcache_mutex);
-    pthread_cond_destroy(&logfs->wcache_cond_worker_thread);
-    device_close(logfs->device);
-    FREE(logfs);
+        if (0 != pthread_join(logfs->worker_thread, NULL)) {
+                TRACE("joining thread fail");
+        }
+        device_close(logfs->device);
+        free(logfs->cur_block);
+        for (i=0; i<RCACHE_BLOCKS; i++) {
+                free(logfs->read_cache[i].buf);
+        }
+        for (i=0; i<WCACHE_BLOCKS; i++) {
+                free(logfs->write_cache[i].buf);
+        }
+        memset(logfs, 0, sizeof(struct logfs));
+        free(logfs);
 }
 
-int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
-    uint64_t remaining;
-    char *temp_buf, *traverse_ptr;
-    remaining = len;
-    traverse_ptr = (char*)buf;
-    temp_buf = (char *)malloc(logfs->block_size);
-            if(!temp_buf){
-                TRACE("Malloc Failed for temp_buf!!");
-                logfs_close(logfs);
+int logfs_append(struct logfs *logfs, const void *buf, uint64_t len) {
+        void *buf_;
+        int readCacheOffset;
+        uint64_t block, remaining;
+
+        buf_ = (void*)buf;
+        remaining = len;
+        block = get_lower_boundary(logfs, logfs->off);
+        readCacheOffset = (block / logfs->block_size) % RCACHE_BLOCKS;
+        if (block == logfs->read_cache[readCacheOffset].block) {
+                logfs->read_cache[readCacheOffset].block = 7;
+        }
+        while(remaining >= logfs->available) {
+                memcpy(logfs->cur_off, buf_, logfs->available);
+                buf_ = (void*)((char*)buf_ + logfs->available);
+                logfs->off += logfs->available;
+                remaining -= logfs->available;
+                logfs->available = 0;
+        struct block *write_cache_block;
+        if (0 != pthread_mutex_lock(&logfs->wc_info.mutex)) {
+                TRACE("error in write_to_cache");
+                exit(1);
+        }
+        while (logfs->wc_info.written_blocks >= WCACHE_BLOCKS) {
+                if (0 != pthread_cond_wait(&logfs->wc_info.user_cond,
+                                           &logfs->wc_info.mutex)) {
+                        TRACE("error in write_to_cache");
+                        exit(1);
+                }
+        }
+
+        write_cache_block = &logfs->write_cache[logfs->wc_info.head];
+        write_cache_block->block = get_lower_boundary(logfs, logfs->off - 1);
+        memcpy(write_cache_block->buf, logfs->cur_block, logfs->block_size);
+
+        logfs->wc_info.head = (logfs->wc_info.head + 1) % WCACHE_BLOCKS;
+        logfs->wc_info.written_blocks++;
+        pthread_cond_signal(&logfs->wc_info.worker_cond);
+
+        if (0 != pthread_mutex_unlock(&logfs->wc_info.mutex)) {
+                TRACE("error in write_to_cache");
+                exit(1);
+        }
+                memset(logfs->cur_block, 0, logfs->block_size);
+                logfs->available = logfs->block_size;
+                logfs->cur_off = logfs->cur_block;
+        }
+        if (0 < remaining){
+                memcpy(logfs->cur_off, buf_, remaining);
+                logfs->off += remaining;
+                logfs->cur_off = (void*)((char*)logfs->cur_off + remaining);
+                logfs->available -= remaining;
+        }
+        return 0;
+}
+
+int check_in_writeCache(struct logfs *logfs, const uint64_t block_start_address, void *buf) {
+        int i, found;
+        pthread_mutex_lock(&logfs->wc_info.mutex);
+        found = 0;
+        for (i=0; i<WCACHE_BLOCKS; i++) {
+                if (block_start_address == logfs->write_cache[i].block) {
+                        memcpy(buf, logfs->write_cache[i].buf, logfs->block_size);
+                        found = 1;
+                        break;
+                }
+        }
+        pthread_mutex_unlock(&logfs->wc_info.mutex);
+        return found;
+}
+
+int read_data(struct logfs *logfs, const uint64_t block_start_address, void *buf, uint64_t off, size_t len) {
+        int readCacheOffset;
+        uint64_t block_off;
+        void *start;
+        struct block *read_cache_block;
+        void *tmp_buf = malloc(2*logfs->block_size);
+        void *buf_ = memory_align(tmp_buf, logfs->block_size);
+
+        readCacheOffset = (block_start_address / logfs->block_size) % RCACHE_BLOCKS;
+        read_cache_block = &logfs->read_cache[readCacheOffset];
+
+        if (block_start_address != read_cache_block->block) {
+                read_cache_block->block = block_start_address;
+                if (block_start_address == get_lower_boundary(logfs, logfs->off)) {
+                        memcpy(buf_, logfs->cur_block, logfs->block_size);
+                }
+                else if (check_in_writeCache(logfs, block_start_address, buf_)) {
+                        assert(1);
+                }
+                else {
+                        if (device_read(logfs->device, buf_,
+                                        block_start_address, logfs->block_size)) {
+                                return -1;
+                        }
+                }
+                memcpy(read_cache_block->buf, buf_, logfs->block_size);
+        }
+        free(tmp_buf);
+        block_off = off - block_start_address;
+        start = (void*)((char*)read_cache_block->buf + block_off);
+        memcpy(buf, start, len);
+        return 0;
+}
+
+int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len) {
+        void *buf_;
+        uint64_t off_, read_len, block_start_address, remaining;
+        buf_ = buf;
+        off_ = off;
+        remaining = len;
+        block_start_address = get_lower_boundary(logfs, off);
+        read_len = MIN(len, block_start_address + logfs->block_size - off);
+
+        if (read_data(logfs, block_start_address, buf_, off_, read_len)) {
                 return -1;
-            }
-    while(remaining > 0){
-        if(remaining >= logfs->block_size){
-            memset(temp_buf,0,logfs->block_size);
-            memcpy(temp_buf, traverse_ptr, logfs->block_size);
-            traverse_ptr += logfs->block_size;
-            remaining -= logfs->block_size;
         }
-        else{
-            memset(temp_buf,0,logfs->block_size);
-            memcpy(temp_buf, traverse_ptr, remaining);
-            traverse_ptr += remaining;
-            remaining = 0;
+        block_start_address += logfs->block_size;
+        buf_ = (void*)((char*)buf_ + read_len);
+        off_ += read_len;
+        remaining -= read_len;
+
+        while(remaining > logfs->block_size) {
+                read_len = logfs->block_size;
+                if (read_data(logfs, block_start_address, buf_, off_, read_len)) {
+                        return -1;
+                }
+                block_start_address += logfs->block_size;
+                buf_ = (void*)((char*)buf_ + read_len);
+                off_ += read_len;
+                remaining -= read_len;
         }
-        write_cache_user_thread(logfs, temp_buf, logfs->block_size);
-    }
-    FREE(temp_buf);
-    return 0;
-}
-uint64_t getLowerBlockBoundary(uint64_t size, uint64_t n){
-    return n - (n%size);
-}
-uint64_t getUpperBlockBoundary(uint64_t size, uint64_t n){
-    uint64_t temp;
-    temp = size-(n%size);
-    return n + temp;
-}
-int checkCache(uint64_t actualOffset){
-    /* returns if cache entry is present or not */
-}
-void readToCache(uint64_t actualOffset){
-    /* read data at this actual offset into cache and store it at cache offset */
-}
-char* readFromCache(uint64_t cacheOffset, uint64_t start, uint64_t len, char* buf){
-    /* read data from cache from this location and store it into buffer */
-}
-int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len){
-    uint64_t lower_block_boundary, upper_block_boundary, i, start, len, rem, curr_block_boundary, cacheOffset;
-    char* traverse_ptr;
-    size_t remaining;
-    traverse_ptr = (char*)buf;
-    lower_block_boundary = getLowerBlockBoundary(logfs->block_size, off);
-    upper_block_boundary = getUpperBlockBoundary(logfs->block_size, off+len);
-    for(i=lower_block_boundary, i<upper_block_boundary, i += logfs->block_size){
-        if(!checkCache(i)){
-            readToCache(i);
+        if (0 != remaining) {
+                if (read_data(logfs, block_start_address, buf_, off_, remaining)) {
+                        return -1;
+                }
         }
-    }
-    remaining = len;
-    curr_block_boundary = lower_block_boundary;
-    while(remaining>0){
-        start = off%(logfs->block_size);
-        rem = logfs->block_size - start;
-        if(remaining > rem){
-            len = rem;
-        }
-        else{
-            len = remaining;
-        }
-        cacheOffset = curr_block_boundary%RCACHE_BLOCKS;
-        traverse_ptr = readFromCache(cacheOffset, start, len, traverse_ptr);
-        curr_block_boundary += logfs->block_size;
-    }
+        return 0;
 }
