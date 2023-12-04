@@ -128,6 +128,10 @@ read_write(const uint64_t N, const uint64_t K, const uint64_t V)
 			return -1;
 		}
 	}
+	kvdb_close(kvdb);
+	FREE(key);
+	FREE(val);
+	FREE(val_);
 	return 0;
 }
 
